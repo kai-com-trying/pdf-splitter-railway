@@ -28,6 +28,14 @@ app.post('/api/split-pdf', async (req, res) => {
     // Convert base64 to buffer
     const pdfBuffer = Buffer.from(pdf, 'base64');
     const pdfDoc = await PDFDocument.load(pdfBuffer, { ignoreEncryption: true });
+
+    // === FIX START: SANITIZATION STEP ===
+    // We save and reload the document to fix any corrupted XRef tables 
+    // or malformed object references before attempting to copy pages.
+    const sanitizedPdfBytes = await pdfDoc.save();
+    pdfDoc = await PDFDocument.load(sanitizedPdfBytes);
+    // === FIX END ===    
+
     const pageCount = pdfDoc.getPageCount();
 
     // If page number specified, return single page
