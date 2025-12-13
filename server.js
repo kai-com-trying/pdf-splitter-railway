@@ -87,6 +87,61 @@ app.post('/api/split-pdf', async (req, res) => {
   }
 });
 
+// Endpoint 2: Convert PDF to Images (Returns PNG base64)
+// This is best for sending visual data to LLMs (Claude/GPT-4o)
+app.post('/api/convert-to-images', async (req, res) => {
+  try {
+    // pages should be an array of numbers, e.g. [1, 2, 3]
+    // If pages is undefined, it converts the whole document (careful with large files)
+    const { pdf, pages } = req.body;
+
+    if (!pdf) {
+      return res.status(400).json({ error: 'PDF data is required' });
+    }
+
+    const pdfBuffer = Buffer.from(pdf, 'base64');
+
+    // Configuration for the conversion
+    const config = {
+      base64: true,  // Return result as base64 strings
+      scale: 3.0     // ~300 DPI (High Res) for reading checkboxes
+    };
+
+    // If specific pages are requested, add them to config
+    if (pages && Array.isArray(pages) && pages.length > 0) {
+      config.page_numbers = pages;
+    }
+
+    console.log(`Converting PDF to images. Pages: ${pages ? pages.join(',') : 'ALL'}`);
+
+    const outputImages = await pdf2img.convert(pdfBuffer, config);
+
+    // Map results to a structured format
+    const responseImages = outputImages.map((imgBase64, index) => {
+      // If pages array was provided, map index to that page number. 
+      // If not, simply assume sequential 1-based indexing.
+      const pageNum = (pages && pages[index]) ? pages[index] : index + 1;
+      
+      return {
+        page: pageNum,
+        base64: imgBase64
+      };
+    });
+
+    return res.status(200).json({
+      count: responseImages.length,
+      images: responseImages
+    });
+
+  } catch (error) {
+    console.error('Error in convert-to-images:', error);
+    return res.status(500).json({ 
+      error: error.message,
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
+  }
+});
+
 // Root endpoint
 app.get('/', (req, res) => {
   res.json({ 
