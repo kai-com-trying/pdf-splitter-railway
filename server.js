@@ -1,5 +1,6 @@
 import express from 'express';
 import { PDFDocument } from 'pdf-lib';
+import pdf2img from 'pdf-img-convert';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
