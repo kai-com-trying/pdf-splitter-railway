@@ -113,7 +113,7 @@ app.post('/api/convert-to-images', async (req, res) => {
       config.page_numbers = pages;
     }
 
-    console.log(`Converting PDF to images. Pages: ${pages ? pages.join(',') : 'ALL'}`);
+    console.log(`Converting PDF to images.`);
 
     const outputImages = await pdf2img.convert(pdfBuffer, config);
 
