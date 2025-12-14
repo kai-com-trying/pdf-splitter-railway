@@ -1,5 +1,5 @@
 import express from 'express';
-import { PDFDocument } from 'pdf-lib';
+import { PDFDocument, StandardFonts } from 'pdf-lib'; // <--- ADDED StandardFonts
 import pdf2img from 'pdf-img-convert';
 
 const app = express();
@@ -54,7 +54,7 @@ app.post('/api/split-pdf', async (req, res) => {
   }
 });
 
-// FIXED ENDPOINT WITH FLATTENING
+// FIXED ENDPOINT WITH APPEARANCE UPDATE + FLATTENING
 app.post('/api/convert-to-images', async (req, res) => {
   try {
     const { pdf, pages } = req.body;
@@ -66,20 +66,31 @@ app.post('/api/convert-to-images', async (req, res) => {
     try {
       const doc = await PDFDocument.load(pdfBuffer, { ignoreEncryption: true });
       const form = doc.getForm();
+      
       if (form) {
+        // 1. Embed a standard font (required to draw the text)
+        const helvetica = await doc.embedFont(StandardFonts.Helvetica);
+        
+        // 2. FORCE update the visual appearance of all fields using this font
+        // This paints the text into the field box so it survives flattening
+        form.updateFieldAppearances(helvetica);
+        
+        // 3. Now flatten (merge the painted text into the page layer)
         form.flatten();
+        
         const flattenedBytes = await doc.save();
         pdfBuffer = Buffer.from(flattenedBytes);
-        console.log('PDF form fields flattened successfully.');
+        console.log('PDF form fields appearances updated & flattened successfully.');
       }
     } catch (e) {
-      console.log('Flattening skipped:', e.message);
+      console.log('Flattening/Appearance update skipped:', e.message);
+      // We continue even if flattening fails, using the original buffer
     }
     // --- END FLATTENING FIX ---
 
     const config = {
       base64: true,
-      scale: 2.0 // Reduced scale
+      scale: 2.0 
     };
 
     if (pages && Array.isArray(pages) && pages.length > 0) {
