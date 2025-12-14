@@ -102,6 +102,29 @@ app.post('/api/convert-to-images', async (req, res) => {
 
     const pdfBuffer = Buffer.from(pdf, 'base64');
 
+    // ---------------------------------------------------------
+    // FIX: FLATTEN FORM FIELDS BEFORE CONVERSION
+    // ---------------------------------------------------------
+    try {
+      // Load the PDF into pdf-lib
+      const doc = await PDFDocument.load(pdfBuffer, { ignoreEncryption: true });
+      
+      // Attempt to get the form. If no form exists, this might throw or return empty.
+      const form = doc.getForm();
+      
+      // If we have a form, flatten it to merge values into the page
+      if (form) {
+        form.flatten();
+        const flattenedBytes = await doc.save();
+        pdfBuffer = Buffer.from(flattenedBytes); // Update buffer with flattened version
+        console.log('PDF form fields flattened successfully.');
+      }
+    } catch (e) {
+      // If the PDF has no form or is XFA, just proceed with original buffer
+      // console.log('No standard AcroForm found or flattening skipped:', e.message);
+    }
+    // ---------------------------------------------------------
+
     // Configuration for the conversion
     const config = {
       base64: true,  // Return result as base64 strings
