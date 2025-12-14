@@ -1,9 +1,9 @@
 {
-  "name": "pdf-splitter-railway",
+  "name": "pdf-splitter",
   "version": "1.0.0",
-  "type": "module",
-  "description": "PDF splitter API for Railway",
+  "description": "API to split PDFs and convert to images",
   "main": "server.js",
+  "type": "module",
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js"
@@ -11,7 +11,7 @@
   "dependencies": {
     "express": "^4.18.2",
     "pdf-lib": "^1.17.1",
-    "pdf-img-convert": "^1.2.1"
+    "pdf2pic": "^3.1.1"
   },
   "engines": {
     "node": ">=18.0.0"
