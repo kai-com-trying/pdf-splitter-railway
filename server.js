@@ -1,9 +1,6 @@
 import express from 'express';
-import { PDFDocument } from 'pdf-lib';
-import { fromPath } from 'pdf2pic';
-import fs from 'fs/promises';
-import path from 'path';
-import os from 'os';
+import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
+import pdf2img from 'pdf-img-convert';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -15,10 +12,62 @@ app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Helper to generate random temp filename
-const getTempFilePath = (ext) => path.join(os.tmpdir(), `pdf-${Date.now()}-${Math.random().toString(36).substring(7)}.${ext}`);
+// --- HELPER: MANUALLY DRAW FORM DATA ONTO PAGES ---
+async function forceFlatten(pdfDoc) {
+  const form = pdfDoc.getForm();
+  const fields = form.getFields();
+  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  const black = rgb(0, 0, 0);
 
-// SPLIT PDF ENDPOINT (Kept same as before, uses pdf-lib)
+  for (const field of fields) {
+    try {
+      const type = field.constructor.name;
+      const widgets = field.acroField.getWidgets();
+
+      for (const widget of widgets) {
+        // Find where this field is located
+        const rect = widget.getRectangle();
+        const page = pdfDoc.findPageForAnnotation(widget);
+
+        if (!page || !rect) continue;
+
+        // DRAW TEXT FIELDS
+        if (type === 'PDFTextField') {
+          const text = field.getText();
+          if (text) {
+            page.drawText(text, {
+              x: rect.x + 2, // Slight padding
+              y: rect.y + (rect.height / 2) - 4, // Center vertically
+              size: 10, // Standard legible size
+              font: font,
+              color: black
+            });
+          }
+        } 
+        // DRAW CHECKBOXES
+        else if (type === 'PDFCheckBox') {
+          if (field.isChecked()) {
+            page.drawText('X', {
+              x: rect.x + (rect.width / 2) - 4, // Center horizontally
+              y: rect.y + (rect.height / 2) - 4, // Center vertically
+              size: 12,
+              font: font,
+              color: black
+            });
+          }
+        }
+      }
+    } catch (err) {
+      // If one field fails, skip it and keep going
+      // console.log("Skipping field:", err.message);
+    }
+  }
+  
+  // Optional: Delete the form data now that we painted it, 
+  // but keeping it doesn't hurt since we drew on top.
+}
+
+// SPLIT PDF ENDPOINT
 app.post('/api/split-pdf', async (req, res) => {
   try {
     const { pdf, page } = req.body;
@@ -57,98 +106,60 @@ app.post('/api/split-pdf', async (req, res) => {
     return res.status(200).json({ count: pageCount, pages: pages });
   } catch (error) {
     console.error('Error:', error);
-    return res.status(500).json({ 
-      error: error.message,
-      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
-    });
+    return res.status(500).json({ error: error.message });
   }
 });
 
-// NEW CONVERT ENDPOINT (Uses Ghostscript via pdf2pic)
+// CONVERT TO IMAGES ENDPOINT (With Manual Flattening)
 app.post('/api/convert-to-images', async (req, res) => {
-  let tempPdfPath = null;
-  
   try {
     const { pdf, pages } = req.body;
     if (!pdf) return res.status(400).json({ error: 'PDF data is required' });
 
-    console.log("Processing PDF conversion request with Ghostscript...");
+    let pdfBuffer = Buffer.from(pdf, 'base64');
 
-    // 1. Write the base64 PDF to a temp file on disk
-    // We MUST write to disk for Ghostscript to process it reliably
-    const pdfBuffer = Buffer.from(pdf, 'base64');
-    tempPdfPath = getTempFilePath('pdf');
-    await fs.writeFile(tempPdfPath, pdfBuffer);
+    // 1. PERFORM MANUAL FLATTENING
+    try {
+      const doc = await PDFDocument.load(pdfBuffer, { ignoreEncryption: true });
+      
+      // Check if form exists
+      const form = doc.getForm();
+      if (form) {
+        // Manually draw the text on top of the fields
+        await forceFlatten(doc);
+        
+        // Save the modifications
+        const flattenedBytes = await doc.save();
+        pdfBuffer = Buffer.from(flattenedBytes);
+        console.log('Manual flattening applied successfully.');
+      }
+    } catch (e) {
+      console.log('Flattening skipped/failed:', e.message);
+    }
 
-    // 2. Configure pdf2pic (The Virtual Printer)
-    const options = {
-      density: 200,           // Quality (DPI)
-      saveFilename: "output", 
-      savePath: os.tmpdir(),  
-      format: "png",
-      width: 1700,            // Standard width for legible text
-      height: 2200
+    // 2. CONVERT TO IMAGES (Using pdf-img-convert)
+    const config = {
+      base64: true,
+      scale: 2.0 
     };
 
-    const convert = fromPath(tempPdfPath, options);
-    
-    // 3. Determine which pages to convert
-    // Note: pdf2pic is 1-indexed
-    let pagesToConvert = [];
     if (pages && Array.isArray(pages) && pages.length > 0) {
-      pagesToConvert = pages;
-    } else {
-      // If no pages specified, we need to know page count to loop
-      const doc = await PDFDocument.load(pdfBuffer, { ignoreEncryption: true });
-      const count = doc.getPageCount();
-      pagesToConvert = Array.from({ length: count }, (_, i) => i + 1);
+      config.page_numbers = pages;
     }
 
-    // 4. Convert specific pages
-    const responseImages = [];
-    
-    // We process sequentially to keep order
-    for (const pageNum of pagesToConvert) {
-      try {
-        // convert(pageNum) returns details about the saved file
-        const result = await convert(pageNum, { responseType: "base64" });
-        
-        // pdf2pic saves to disk, so we read it back
-        if (result.path) {
-            const imageBuffer = await fs.readFile(result.path);
-            const base64Str = imageBuffer.toString('base64');
-            
-            responseImages.push({
-                page: pageNum,
-                base64: base64Str
-            });
+    console.log(`Converting PDF to images...`);
+    const outputImages = await pdf2img.convert(pdfBuffer, config);
 
-            // Cleanup the individual image file
-            await fs.unlink(result.path).catch(() => {});
-        }
-      } catch (err) {
-        console.error(`Error converting page ${pageNum}:`, err);
-      }
-    }
-
-    // 5. Cleanup the source PDF
-    if (tempPdfPath) {
-        await fs.unlink(tempPdfPath).catch(() => {});
-    }
-
-    return res.status(200).json({
-      count: responseImages.length,
-      images: responseImages
+    const responseImages = outputImages.map((imgBase64, index) => {
+      const pageNum = (pages && pages[index]) ? pages[index] : index + 1;
+      return { page: pageNum, base64: imgBase64 };
     });
+
+    return res.status(200).json({ count: responseImages.length, images: responseImages });
 
   } catch (error) {
     console.error('Error in convert-to-images:', error);
-    // Try to cleanup if error occurred
-    if (tempPdfPath) await fs.unlink(tempPdfPath).catch(() => {});
-    
-    return res.status(500).json({ 
-      error: error.message 
-    });
+    return res.status(500).json({ error: error.message });
   }
 });
 
