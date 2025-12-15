@@ -1,7 +1,2 @@
 [phases.setup]
 aptPkgs = ["poppler-utils"]
-```
-
-Or in Railway dashboard: Settings → Build → Add install command:
-```
-apt-get update && apt-get install -y poppler-utils
