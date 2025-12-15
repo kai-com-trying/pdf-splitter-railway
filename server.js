@@ -1,6 +1,14 @@
 import express from 'express';
-import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
-import pdf2img from 'pdf-img-convert';
+import { PDFDocument } from 'pdf-lib';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import fs from 'fs/promises';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const execAsync = promisify(exec);
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -12,59 +20,23 @@ app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// --- HELPER: MANUALLY DRAW FORM DATA ONTO PAGES ---
-async function forceFlatten(pdfDoc) {
-  const form = pdfDoc.getForm();
-  const fields = form.getFields();
-  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
-  const black = rgb(0, 0, 0);
-
-  for (const field of fields) {
-    try {
-      const type = field.constructor.name;
-      const widgets = field.acroField.getWidgets();
-
-      for (const widget of widgets) {
-        // Find where this field is located
-        const rect = widget.getRectangle();
-        const page = pdfDoc.findPageForAnnotation(widget);
-
-        if (!page || !rect) continue;
-
-        // DRAW TEXT FIELDS
-        if (type === 'PDFTextField') {
-          const text = field.getText();
-          if (text) {
-            page.drawText(text, {
-              x: rect.x + 2, // Slight padding
-              y: rect.y + (rect.height / 2) - 4, // Center vertically
-              size: 10, // Standard legible size
-              font: font,
-              color: black
-            });
-          }
-        } 
-        // DRAW CHECKBOXES
-        else if (type === 'PDFCheckBox') {
-          if (field.isChecked()) {
-            page.drawText('X', {
-              x: rect.x + (rect.width / 2) - 4, // Center horizontally
-              y: rect.y + (rect.height / 2) - 4, // Center vertically
-              size: 12,
-              font: font,
-              color: black
-            });
-          }
-        }
-      }
-    } catch (err) {
-      // If one field fails, skip it and keep going
-      // console.log("Skipping field:", err.message);
+// --- HELPER: FLATTEN FORM DATA ---
+async function flattenPdfForm(pdfDoc) {
+  try {
+    const form = pdfDoc.getForm();
+    const fields = form.getFields();
+    
+    if (fields.length === 0) {
+      return false;
     }
+    
+    form.flatten();
+    console.log(`Flattened ${fields.length} form fields`);
+    return true;
+  } catch (err) {
+    console.log('Form flattening skipped:', err.message);
+    return false;
   }
-  
-  // Optional: Delete the form data now that we painted it, 
-  // but keeping it doesn't hurt since we drew on top.
 }
 
 // SPLIT PDF ENDPOINT
@@ -110,61 +82,127 @@ app.post('/api/split-pdf', async (req, res) => {
   }
 });
 
-// CONVERT TO IMAGES ENDPOINT (With Manual Flattening)
+// CONVERT TO IMAGES ENDPOINT (Using pdftoppm for better text rendering)
 app.post('/api/convert-to-images', async (req, res) => {
+  const tempDir = path.join(__dirname, 'temp');
+  let tempPdfPath = null;
+  let outputPrefix = null;
+
   try {
     const { pdf, pages } = req.body;
     if (!pdf) return res.status(400).json({ error: 'PDF data is required' });
 
+    // Ensure temp directory exists
+    await fs.mkdir(tempDir, { recursive: true });
+
     let pdfBuffer = Buffer.from(pdf, 'base64');
 
-    // 1. PERFORM MANUAL FLATTENING
+    // 1. FLATTEN THE PDF FORM
     try {
-      const doc = await PDFDocument.load(pdfBuffer, { ignoreEncryption: true });
+      const doc = await PDFDocument.load(pdfBuffer, { 
+        ignoreEncryption: true,
+        updateMetadata: false 
+      });
       
-      // Check if form exists
-      const form = doc.getForm();
-      if (form) {
-        // Manually draw the text on top of the fields
-        await forceFlatten(doc);
-        
-        // Save the modifications
-        const flattenedBytes = await doc.save();
+      const wasFlattened = await flattenPdfForm(doc);
+      
+      if (wasFlattened) {
+        const flattenedBytes = await doc.save({
+          useObjectStreams: false,
+          addDefaultPage: false
+        });
         pdfBuffer = Buffer.from(flattenedBytes);
-        console.log('Manual flattening applied successfully.');
+        console.log('PDF form flattened successfully');
       }
     } catch (e) {
       console.log('Flattening skipped/failed:', e.message);
     }
 
-    // 2. CONVERT TO IMAGES (Using pdf-img-convert)
-    const config = {
-      base64: true,
-      scale: 2.0 
-    };
+    // 2. SAVE TEMP PDF
+    const timestamp = Date.now();
+    tempPdfPath = path.join(tempDir, `input_${timestamp}.pdf`);
+    outputPrefix = path.join(tempDir, `output_${timestamp}`);
+    
+    await fs.writeFile(tempPdfPath, pdfBuffer);
 
+    // 3. CONVERT USING pdftoppm (part of poppler-utils)
+    // -png: output as PNG
+    // -r 150: 150 DPI (good quality for OCR)
+    // -f and -l: first and last page to convert
+    let command = `pdftoppm -png -r 150 "${tempPdfPath}" "${outputPrefix}"`;
+    
     if (pages && Array.isArray(pages) && pages.length > 0) {
-      config.page_numbers = pages;
+      // For specific pages, we need multiple commands
+      const pageCommands = pages.map(pageNum => 
+        `pdftoppm -png -r 150 -f ${pageNum} -l ${pageNum} "${tempPdfPath}" "${outputPrefix}_page${pageNum}"`
+      );
+      command = pageCommands.join(' && ');
     }
 
-    console.log(`Converting PDF to images...`);
-    const outputImages = await pdf2img.convert(pdfBuffer, config);
+    console.log('Converting PDF to images using pdftoppm...');
+    await execAsync(command);
 
-    const responseImages = outputImages.map((imgBase64, index) => {
-      const pageNum = (pages && pages[index]) ? pages[index] : index + 1;
-      return { page: pageNum, base64: imgBase64 };
+    // 4. READ THE GENERATED IMAGES
+    const files = await fs.readdir(tempDir);
+    const imageFiles = files
+      .filter(f => f.startsWith(`output_${timestamp}`) && f.endsWith('.png'))
+      .sort();
+
+    const responseImages = [];
+    
+    for (const file of imageFiles) {
+      const filePath = path.join(tempDir, file);
+      const imageBuffer = await fs.readFile(filePath);
+      const base64Image = imageBuffer.toString('base64');
+      
+      // Extract page number from filename (format: output_timestamp-N.png)
+      const match = file.match(/-(\d+)\.png$/);
+      const pageNum = match ? parseInt(match[1]) : responseImages.length + 1;
+      
+      responseImages.push({ page: pageNum, base64: base64Image });
+      
+      // Clean up the image file
+      await fs.unlink(filePath);
+    }
+
+    // Clean up temp PDF
+    if (tempPdfPath) {
+      await fs.unlink(tempPdfPath);
+    }
+
+    return res.status(200).json({ 
+      count: responseImages.length, 
+      images: responseImages 
     });
-
-    return res.status(200).json({ count: responseImages.length, images: responseImages });
 
   } catch (error) {
     console.error('Error in convert-to-images:', error);
+    
+    // Cleanup on error
+    try {
+      if (tempPdfPath) await fs.unlink(tempPdfPath);
+      if (outputPrefix) {
+        const files = await fs.readdir(tempDir);
+        const cleanupFiles = files.filter(f => f.startsWith(`output_${Date.now()}`));
+        await Promise.all(cleanupFiles.map(f => fs.unlink(path.join(tempDir, f))));
+      }
+    } catch (cleanupError) {
+      console.error('Cleanup error:', cleanupError);
+    }
+    
     return res.status(500).json({ error: error.message });
   }
 });
 
 app.get('/', (req, res) => {
-  res.json({ message: 'PDF Splitter API', endpoints: { health: 'GET /health', splitPdf: 'POST /api/split-pdf' } });
+  res.json({ 
+    message: 'PDF Splitter API', 
+    endpoints: { 
+      health: 'GET /health', 
+      splitPdf: 'POST /api/split-pdf',
+      convertToImages: 'POST /api/convert-to-images'
+    } 
+  });
 });
 
 app.listen(PORT, () => {
