@@ -121,11 +121,11 @@ app.post('/api/convert-to-images', async (req, res) => {
     await fs.writeFile(tempPdfPath, pdfBuffer);
 
     // Convert using pdftoppm
-    let command = `pdftoppm -png -r 200 "${tempPdfPath}" "${outputPrefix}"`;
+    let command = `pdftoppm -jpeg -jpegopt quality=85 -r 200 "${tempPdfPath}" "${outputPrefix}"`;
     
     if (pages && Array.isArray(pages) && pages.length > 0) {
       const pageCommands = pages.map(pageNum => 
-        `pdftoppm -png -r 200 -f ${pageNum} -l ${pageNum} "${tempPdfPath}" "${outputPrefix}_page${pageNum}"`
+        `pdftoppm -jpeg -jpegopt quality=85 -r 200 -f ${pageNum} -l ${pageNum} "${tempPdfPath}" "${outputPrefix}_page${pageNum}"`
       );
       command = pageCommands.join(' && ');
     }
@@ -136,7 +136,7 @@ app.post('/api/convert-to-images', async (req, res) => {
     // Read the generated images
     const files = await fs.readdir(tempDir);
     const imageFiles = files
-      .filter(f => f.startsWith(`output_${timestamp}`) && f.endsWith('.png'))
+      .filter(f => f.startsWith(`output_${timestamp}`) && f.endsWith('.jpg'))
       .sort();
 
     const responseImages = [];
@@ -146,7 +146,7 @@ app.post('/api/convert-to-images', async (req, res) => {
       const imageBuffer = await fs.readFile(filePath);
       const base64Image = imageBuffer.toString('base64');
       
-      const match = file.match(/-(\d+)\.png$/);
+      const match = file.match(/-(\d+)\.jpg$/);
       const pageNum = match ? parseInt(match[1]) : responseImages.length + 1;
       
       responseImages.push({ page: pageNum, base64: base64Image });
