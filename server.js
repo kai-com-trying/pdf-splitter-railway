@@ -98,34 +98,32 @@ app.post('/api/split-pdf', async (req, res) => {
   }
 });
 
-// CONVERT TO IMAGES ENDPOINT (Using pdftoppm)
+// CONVERT TO IMAGES ENDPOINT (Using pdftoppm with resizing)
 app.post('/api/convert-to-images', async (req, res) => {
   const tempDir = path.join(__dirname, 'temp');
   let tempPdfPath = null;
   let outputPrefix = null;
 
   try {
-    const { pdf, pages } = req.body;
+    const { pdf, pages, maxSize = 5 } = req.body; // maxSize in MB, default 5MB
     if (!pdf) return res.status(400).json({ error: 'PDF data is required' });
 
-    // Ensure temp directory exists
     await fs.mkdir(tempDir, { recursive: true });
 
     const pdfBuffer = Buffer.from(pdf, 'base64');
 
-    // Save temp PDF
     const timestamp = Date.now();
     tempPdfPath = path.join(tempDir, `input_${timestamp}.pdf`);
     outputPrefix = path.join(tempDir, `output_${timestamp}`);
     
     await fs.writeFile(tempPdfPath, pdfBuffer);
 
-    // Convert using pdftoppm
-    let command = `pdftoppm -jpeg -jpegopt quality=85 -r 200 "${tempPdfPath}" "${outputPrefix}"`;
+    // Convert using pdftoppm with high quality
+    let command = `pdftoppm -jpeg -jpegopt quality=95 -r 200 "${tempPdfPath}" "${outputPrefix}"`;
     
     if (pages && Array.isArray(pages) && pages.length > 0) {
       const pageCommands = pages.map(pageNum => 
-        `pdftoppm -jpeg -jpegopt quality=85 -r 200 -f ${pageNum} -l ${pageNum} "${tempPdfPath}" "${outputPrefix}_page${pageNum}"`
+        `pdftoppm -jpeg -jpegopt quality=95 -r 200 -f ${pageNum} -l ${pageNum} "${tempPdfPath}" "${outputPrefix}_page${pageNum}"`
       );
       command = pageCommands.join(' && ');
     }
@@ -133,23 +131,47 @@ app.post('/api/convert-to-images', async (req, res) => {
     console.log('Converting PDF to images using pdftoppm...');
     await execAsync(command);
 
-    // Read the generated images
+    // Read and process images
     const files = await fs.readdir(tempDir);
     const imageFiles = files
       .filter(f => f.startsWith(`output_${timestamp}`) && f.endsWith('.jpg'))
       .sort();
 
     const responseImages = [];
+    const maxSizeBytes = maxSize * 1024 * 1024; // Convert MB to bytes
     
     for (const file of imageFiles) {
       const filePath = path.join(tempDir, file);
-      const imageBuffer = await fs.readFile(filePath);
-      const base64Image = imageBuffer.toString('base64');
+      let imageBuffer = await fs.readFile(filePath);
       
+      // If image exceeds max size, resize it
+      if (imageBuffer.length > maxSizeBytes) {
+        console.log(`Image ${file} is ${(imageBuffer.length / 1024 / 1024).toFixed(2)}MB, resizing...`);
+        
+        // Calculate scaling factor to get under maxSize
+        const scaleFactor = Math.sqrt(maxSizeBytes / imageBuffer.length) * 0.9; // 0.9 for safety margin
+        const scalePercent = Math.floor(scaleFactor * 100);
+        
+        const resizedPath = filePath.replace('.jpg', '_resized.jpg');
+        
+        // Use ImageMagick to resize (comes with most Linux distros)
+        await execAsync(`convert "${filePath}" -resize ${scalePercent}% -quality 95 "${resizedPath}"`);
+        
+        imageBuffer = await fs.readFile(resizedPath);
+        await fs.unlink(resizedPath);
+        
+        console.log(`Resized to ${(imageBuffer.length / 1024 / 1024).toFixed(2)}MB`);
+      }
+      
+      const base64Image = imageBuffer.toString('base64');
       const match = file.match(/-(\d+)\.jpg$/);
       const pageNum = match ? parseInt(match[1]) : responseImages.length + 1;
       
-      responseImages.push({ page: pageNum, base64: base64Image });
+      responseImages.push({ 
+        page: pageNum, 
+        base64: base64Image,
+        size_mb: (imageBuffer.length / 1024 / 1024).toFixed(2)
+      });
       
       await fs.unlink(filePath);
     }
@@ -166,7 +188,6 @@ app.post('/api/convert-to-images', async (req, res) => {
   } catch (error) {
     console.error('Error in convert-to-images:', error);
     
-    // Cleanup on error
     try {
       if (tempPdfPath) await fs.unlink(tempPdfPath);
       const files = await fs.readdir(tempDir);
