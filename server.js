@@ -119,11 +119,11 @@ app.post('/api/convert-to-images', async (req, res) => {
     await fs.writeFile(tempPdfPath, pdfBuffer);
 
     // Convert using pdftoppm with high quality
-    let command = `pdftoppm -jpeg -jpegopt quality=95 -r 250 "${tempPdfPath}" "${outputPrefix}"`;
+    let command = `pdftoppm -jpeg -jpegopt quality=95 -r 300 "${tempPdfPath}" "${outputPrefix}"`;
     
     if (pages && Array.isArray(pages) && pages.length > 0) {
       const pageCommands = pages.map(pageNum => 
-        `pdftoppm -jpeg -jpegopt quality=95 -r 250 -f ${pageNum} -l ${pageNum} "${tempPdfPath}" "${outputPrefix}_page${pageNum}"`
+        `pdftoppm -jpeg -jpegopt quality=95 -r 300 -f ${pageNum} -l ${pageNum} "${tempPdfPath}" "${outputPrefix}_page${pageNum}"`
       );
       command = pageCommands.join(' && ');
     }
