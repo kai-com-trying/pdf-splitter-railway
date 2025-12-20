@@ -119,11 +119,11 @@ app.post('/api/convert-to-images', async (req, res) => {
     await fs.writeFile(tempPdfPath, pdfBuffer);
 
     // Convert using pdftoppm with high quality
-    let command = `pdftoppm -jpeg -jpegopt quality=95 -r 300 "${tempPdfPath}" "${outputPrefix}"`;
+    let command = `pdftoppm -png -r 300 "${tempPdfPath}" "${outputPrefix}"`;
     
     if (pages && Array.isArray(pages) && pages.length > 0) {
       const pageCommands = pages.map(pageNum => 
-        `pdftoppm -jpeg -jpegopt quality=95 -r 300 -f ${pageNum} -l ${pageNum} "${tempPdfPath}" "${outputPrefix}_page${pageNum}"`
+        `pdftoppm -png -r 300 -f ${pageNum} -l ${pageNum} "${tempPdfPath}" "${outputPrefix}_page${pageNum}"`
       );
       command = pageCommands.join(' && ');
     }
@@ -134,7 +134,7 @@ app.post('/api/convert-to-images', async (req, res) => {
     // Read and process images
     const files = await fs.readdir(tempDir);
     const imageFiles = files
-      .filter(f => f.startsWith(`output_${timestamp}`) && f.endsWith('.jpg'))
+      .filter(f => f.startsWith(`output_${timestamp}`) && f.endsWith('.png'))
       .sort();
 
     const responseImages = [];
@@ -155,7 +155,7 @@ app.post('/api/convert-to-images', async (req, res) => {
         const resizedPath = filePath.replace('.jpg', '_resized.jpg');
         
         // Use ImageMagick to resize (comes with most Linux distros)
-        await execAsync(`convert "${filePath}" -resize ${scalePercent}% -quality 95 "${resizedPath}"`);
+        await execAsync(`convert "${filePath}" -resize ${scalePercent}% "${resizedPath}"`);
         
         imageBuffer = await fs.readFile(resizedPath);
         await fs.unlink(resizedPath);
@@ -164,7 +164,7 @@ app.post('/api/convert-to-images', async (req, res) => {
       }
       
       const base64Image = imageBuffer.toString('base64');
-      const match = file.match(/-(\d+)\.jpg$/);
+      const match = file.match(/-(\d+)\.png$/);
       const pageNum = match ? parseInt(match[1]) : responseImages.length + 1;
       
       responseImages.push({ 
