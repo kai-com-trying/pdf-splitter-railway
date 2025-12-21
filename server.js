@@ -152,7 +152,7 @@ app.post('/api/convert-to-images', async (req, res) => {
         const scaleFactor = Math.sqrt(maxSizeBytes / imageBuffer.length) * 0.9; // 0.9 for safety margin
         const scalePercent = Math.floor(scaleFactor * 100);
         
-        const resizedPath = filePath.replace('.jpg', '_resized.jpg');
+        const resizedPath = filePath.replace('.png', '_resized.png');
         
         // Use ImageMagick to resize (comes with most Linux distros)
         await execAsync(`convert "${filePath}" -resize ${scalePercent}% "${resizedPath}"`);
