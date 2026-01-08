@@ -98,21 +98,22 @@ app.post('/api/split-pdf', async (req, res) => {
   }
 });
 
-// CONVERT TO IMAGES ENDPOINT (Using pdftoppm with resizing)
+// CONVERT TO IMAGES ENDPOINT (Using pdftoppm with dimension and size checking)
 app.post('/api/convert-to-images', async (req, res) => {
   const tempDir = path.join(__dirname, 'temp');
   let tempPdfPath = null;
   let outputPrefix = null;
+  let timestamp = null;
 
   try {
-    const { pdf, pages, maxSize = 5 } = req.body; // maxSize in MB, default 5MB
+    const { pdf, pages, maxSize = 5, maxDimension = 8000 } = req.body; // maxSize in MB, maxDimension in pixels
     if (!pdf) return res.status(400).json({ error: 'PDF data is required' });
 
     await fs.mkdir(tempDir, { recursive: true });
 
     const pdfBuffer = Buffer.from(pdf, 'base64');
 
-    const timestamp = Date.now();
+    timestamp = Date.now();
     tempPdfPath = path.join(tempDir, `input_${timestamp}.pdf`);
     outputPrefix = path.join(tempDir, `output_${timestamp}`);
     
@@ -143,34 +144,93 @@ app.post('/api/convert-to-images', async (req, res) => {
     for (const file of imageFiles) {
       const filePath = path.join(tempDir, file);
       let imageBuffer = await fs.readFile(filePath);
+      let needsResize = false;
+      let resizeReason = '';
       
-      // If image exceeds max size, resize it
+      // Check pixel dimensions first (CRITICAL for Anthropic API)
+      const { stdout: dimensionOutput } = await execAsync(`identify -format "%w %h" "${filePath}"`);
+      const [width, height] = dimensionOutput.trim().split(' ').map(Number);
+      
+      console.log(`Image ${file}: ${width}x${height} pixels, ${(imageBuffer.length / 1024 / 1024).toFixed(2)}MB`);
+      
+      // Check if dimensions exceed maxDimension (Anthropic API limit)
+      if (width > maxDimension || height > maxDimension) {
+        needsResize = true;
+        resizeReason = `dimensions (${width}x${height}) exceed ${maxDimension}px`;
+      }
+      
+      // Check if file size exceeds maxSize
       if (imageBuffer.length > maxSizeBytes) {
-        console.log(`Image ${file} is ${(imageBuffer.length / 1024 / 1024).toFixed(2)}MB, resizing...`);
-        
-        // Calculate scaling factor to get under maxSize
-        const scaleFactor = Math.sqrt(maxSizeBytes / imageBuffer.length) * 0.9; // 0.9 for safety margin
-        const scalePercent = Math.floor(scaleFactor * 100);
+        needsResize = true;
+        resizeReason = resizeReason 
+          ? `${resizeReason} AND file size (${(imageBuffer.length / 1024 / 1024).toFixed(2)}MB) exceeds ${maxSize}MB`
+          : `file size (${(imageBuffer.length / 1024 / 1024).toFixed(2)}MB) exceeds ${maxSize}MB`;
+      }
+      
+      if (needsResize) {
+        console.log(`Resizing ${file}: ${resizeReason}`);
         
         const resizedPath = filePath.replace('.png', '_resized.png');
         
-        // Use ImageMagick to resize (comes with most Linux distros)
-        await execAsync(`convert "${filePath}" -resize ${scalePercent}% "${resizedPath}"`);
+        // Calculate new dimensions maintaining aspect ratio
+        let newWidth = width;
+        let newHeight = height;
+        
+        // First, ensure dimensions are under maxDimension
+        if (width > maxDimension || height > maxDimension) {
+          if (width > height) {
+            newWidth = maxDimension;
+            newHeight = Math.floor(height * (maxDimension / width));
+          } else {
+            newHeight = maxDimension;
+            newWidth = Math.floor(width * (maxDimension / height));
+          }
+          
+          console.log(`  → Dimension resize: ${width}x${height} → ${newWidth}x${newHeight}`);
+        }
+        
+        // Resize using ImageMagick with dimension constraints
+        await execAsync(`convert "${filePath}" -resize ${newWidth}x${newHeight} "${resizedPath}"`);
         
         imageBuffer = await fs.readFile(resizedPath);
-        await fs.unlink(resizedPath);
         
-        console.log(`Resized to ${(imageBuffer.length / 1024 / 1024).toFixed(2)}MB`);
+        // If still too large by file size, reduce quality
+        if (imageBuffer.length > maxSizeBytes) {
+          console.log(`  → Still ${(imageBuffer.length / 1024 / 1024).toFixed(2)}MB, reducing quality...`);
+          
+          // Calculate quality reduction needed
+          const qualityFactor = Math.sqrt(maxSizeBytes / imageBuffer.length) * 0.9; // 0.9 for safety
+          const quality = Math.max(60, Math.floor(qualityFactor * 100)); // Min 60% quality
+          
+          const qualityPath = filePath.replace('.png', '_quality.png');
+          await execAsync(`convert "${resizedPath}" -quality ${quality} "${qualityPath}"`);
+          
+          await fs.unlink(resizedPath);
+          imageBuffer = await fs.readFile(qualityPath);
+          await fs.unlink(qualityPath);
+        } else {
+          await fs.unlink(resizedPath);
+        }
+        
+        console.log(`  ✓ Final: ${(imageBuffer.length / 1024 / 1024).toFixed(2)}MB`);
       }
       
       const base64Image = imageBuffer.toString('base64');
       const match = file.match(/-(\d+)\.png$/);
       const pageNum = match ? parseInt(match[1]) : responseImages.length + 1;
       
+      // Get final dimensions
+      const finalDimensions = needsResize ? 
+        await execAsync(`identify -format "%w %h" "${filePath}"`).then(r => r.stdout.trim()) :
+        `${width} ${height}`;
+      const [finalWidth, finalHeight] = finalDimensions.split(' ').map(Number);
+      
       responseImages.push({ 
         page: pageNum, 
         base64: base64Image,
-        size_mb: (imageBuffer.length / 1024 / 1024).toFixed(2)
+        size_mb: (imageBuffer.length / 1024 / 1024).toFixed(2),
+        dimensions: `${finalWidth}x${finalHeight}`,
+        resized: needsResize
       });
       
       await fs.unlink(filePath);
@@ -182,7 +242,9 @@ app.post('/api/convert-to-images', async (req, res) => {
 
     return res.status(200).json({ 
       count: responseImages.length, 
-      images: responseImages 
+      images: responseImages,
+      maxDimension: maxDimension,
+      maxSize: maxSize
     });
 
   } catch (error) {
@@ -190,9 +252,11 @@ app.post('/api/convert-to-images', async (req, res) => {
     
     try {
       if (tempPdfPath) await fs.unlink(tempPdfPath);
-      const files = await fs.readdir(tempDir);
-      const cleanupFiles = files.filter(f => f.startsWith(`output_${timestamp}`));
-      await Promise.all(cleanupFiles.map(f => fs.unlink(path.join(tempDir, f)).catch(() => {})));
+      if (timestamp) {
+        const files = await fs.readdir(tempDir);
+        const cleanupFiles = files.filter(f => f.startsWith(`output_${timestamp}`));
+        await Promise.all(cleanupFiles.map(f => fs.unlink(path.join(tempDir, f)).catch(() => {})));
+      }
     } catch (cleanupError) {
       console.error('Cleanup error:', cleanupError);
     }
