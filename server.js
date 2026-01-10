@@ -168,7 +168,7 @@ app.post('/api/convert-to-images', async (req, res) => {
       
       // Check actual dimensions
       const { stdout: dimensionOutput } = await execAsync(`identify -format "%w %h" "${filePath}"`);
-      const [width, height] = dimensionOutput.trim().split(' ').map(Number);
+      let [width, height] = dimensionOutput.trim().split(' ').map(Number);
       
       console.log(`Image ${file}: ${width}x${height} pixels, ${(imageBuffer.length / 1024 / 1024).toFixed(2)}MB`);
       
@@ -211,6 +211,40 @@ app.post('/api/convert-to-images', async (req, res) => {
         await fs.unlink(resizedPath);
         
         console.log(`  → Resized to ${newWidth}x${newHeight}, ${(imageBuffer.length / 1024 / 1024).toFixed(2)}MB`);
+        
+        // Update width/height to track actual dimensions
+        width = newWidth;
+        height = newHeight;
+        
+        // CRITICAL: Check if still over 5MB after dimension resize
+        if (imageBuffer.length > maxSizeBytes) {
+          console.log(`  ⚠️  Still ${(imageBuffer.length / 1024 / 1024).toFixed(2)}MB after resize, reducing dimensions further...`);
+          
+          // Calculate how much smaller we need to go (PNG doesn't compress well, so reduce dimensions)
+          const sizeFactor = Math.sqrt(maxSizeBytes / imageBuffer.length) * 0.85; // 0.85 for safety margin
+          const finalWidth = Math.floor(newWidth * sizeFactor);
+          const finalHeight = Math.floor(newHeight * sizeFactor);
+          
+          const finalPath = filePath.replace('.png', '_final.png');
+          
+          // Write current buffer to temp file first
+          const tempResizedPath = filePath.replace('.png', '_temp.png');
+          await fs.writeFile(tempResizedPath, imageBuffer);
+          
+          await execAsync(`convert "${tempResizedPath}" -limit memory 256MB -limit map 512MB -resize ${finalWidth}x${finalHeight} -strip "${finalPath}"`);
+          
+          imageBuffer = await fs.readFile(finalPath);
+          
+          // Cleanup temp files
+          await fs.unlink(tempResizedPath);
+          await fs.unlink(finalPath);
+          
+          console.log(`  ✓ Final size: ${finalWidth}x${finalHeight}, ${(imageBuffer.length / 1024 / 1024).toFixed(2)}MB`);
+          
+          // Update dimensions for response
+          width = finalWidth;
+          height = finalHeight;
+        }
       }
       
       const base64Image = imageBuffer.toString('base64');
