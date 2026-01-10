@@ -201,14 +201,14 @@ app.post('/api/convert-to-images', async (req, res) => {
           }
         }
         
-        // Convert to JPEG for better compression and less memory usage
-        const jpegPath = filePath.replace('.png', '.jpg');
+        // Keep PNG format for better text clarity
+        const resizedPath = filePath.replace('.png', '_resized.png');
         
         // Use progressive resizing for memory efficiency
-        await execAsync(`convert "${filePath}" -limit memory 256MB -limit map 512MB -resize ${newWidth}x${newHeight} -quality 85 -strip "${jpegPath}"`);
+        await execAsync(`convert "${filePath}" -limit memory 256MB -limit map 512MB -resize ${newWidth}x${newHeight} -strip "${resizedPath}"`);
         
-        imageBuffer = await fs.readFile(jpegPath);
-        await fs.unlink(jpegPath);
+        imageBuffer = await fs.readFile(resizedPath);
+        await fs.unlink(resizedPath);
         
         console.log(`  → Resized to ${newWidth}x${newHeight}, ${(imageBuffer.length / 1024 / 1024).toFixed(2)}MB`);
       }
