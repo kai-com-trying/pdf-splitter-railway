@@ -98,7 +98,7 @@ app.post('/api/split-pdf', async (req, res) => {
   }
 });
 
-// CONVERT TO IMAGES ENDPOINT (Using pdftoppm with dimension and size checking)
+// CONVERT TO IMAGES ENDPOINT (Using pdftoppm with smart DPI calculation)
 app.post('/api/convert-to-images', async (req, res) => {
   const tempDir = path.join(__dirname, 'temp');
   let tempPdfPath = null;
@@ -106,30 +106,51 @@ app.post('/api/convert-to-images', async (req, res) => {
   let timestamp = null;
 
   try {
-    const { pdf, pages, maxSize = 5, maxDimension = 8000 } = req.body; // maxSize in MB, maxDimension in pixels
+    const { pdf, pages, maxSize = 5, maxDimension = 8000 } = req.body;
     if (!pdf) return res.status(400).json({ error: 'PDF data is required' });
 
     await fs.mkdir(tempDir, { recursive: true });
 
     const pdfBuffer = Buffer.from(pdf, 'base64');
-
     timestamp = Date.now();
     tempPdfPath = path.join(tempDir, `input_${timestamp}.pdf`);
     outputPrefix = path.join(tempDir, `output_${timestamp}`);
     
     await fs.writeFile(tempPdfPath, pdfBuffer);
 
-    // Convert using pdftoppm with high quality
-    let command = `pdftoppm -png -r 300 "${tempPdfPath}" "${outputPrefix}"`;
+    // Get PDF page dimensions using pdfinfo
+    const { stdout: infoOutput } = await execAsync(`pdfinfo "${tempPdfPath}"`);
+    const pageSizeMatch = infoOutput.match(/Page size:\s+([\d.]+)\s+x\s+([\d.]+)/);
+    
+    let dpi = 300; // Default DPI
+    
+    if (pageSizeMatch) {
+      const pdfWidthPt = parseFloat(pageSizeMatch[1]);
+      const pdfHeightPt = parseFloat(pageSizeMatch[2]);
+      
+      // Calculate what DPI would give us maxDimension on the longest side
+      // PDF points to pixels: pixels = (points / 72) * DPI
+      const maxPdfDimPt = Math.max(pdfWidthPt, pdfHeightPt);
+      const targetDpi = (maxDimension * 72) / maxPdfDimPt;
+      
+      // Use the lower of target DPI or 300 DPI to avoid oversized images
+      dpi = Math.min(Math.floor(targetDpi), 300);
+      
+      console.log(`PDF dimensions: ${pdfWidthPt}x${pdfHeightPt} pt`);
+      console.log(`Calculated DPI: ${dpi} (to fit in ${maxDimension}px)`);
+    }
+
+    // Convert using pdftoppm with calculated DPI
+    let command = `pdftoppm -png -r ${dpi} "${tempPdfPath}" "${outputPrefix}"`;
     
     if (pages && Array.isArray(pages) && pages.length > 0) {
       const pageCommands = pages.map(pageNum => 
-        `pdftoppm -png -r 300 -f ${pageNum} -l ${pageNum} "${tempPdfPath}" "${outputPrefix}_page${pageNum}"`
+        `pdftoppm -png -r ${dpi} -f ${pageNum} -l ${pageNum} "${tempPdfPath}" "${outputPrefix}_page${pageNum}"`
       );
       command = pageCommands.join(' && ');
     }
 
-    console.log('Converting PDF to images using pdftoppm...');
+    console.log('Converting PDF to images with DPI:', dpi);
     await execAsync(command);
 
     // Read and process images
@@ -139,44 +160,37 @@ app.post('/api/convert-to-images', async (req, res) => {
       .sort();
 
     const responseImages = [];
-    const maxSizeBytes = maxSize * 1024 * 1024; // Convert MB to bytes
+    const maxSizeBytes = maxSize * 1024 * 1024;
     
     for (const file of imageFiles) {
       const filePath = path.join(tempDir, file);
       let imageBuffer = await fs.readFile(filePath);
-      let needsResize = false;
-      let resizeReason = '';
       
-      // Check pixel dimensions first (CRITICAL for Anthropic API)
+      // Check actual dimensions
       const { stdout: dimensionOutput } = await execAsync(`identify -format "%w %h" "${filePath}"`);
       const [width, height] = dimensionOutput.trim().split(' ').map(Number);
       
       console.log(`Image ${file}: ${width}x${height} pixels, ${(imageBuffer.length / 1024 / 1024).toFixed(2)}MB`);
       
-      // Check if dimensions exceed maxDimension (Anthropic API limit)
+      let needsResize = false;
+      
+      // Double-check dimensions (shouldn't happen with smart DPI, but just in case)
       if (width > maxDimension || height > maxDimension) {
+        console.log(`WARNING: Image still exceeds ${maxDimension}px, force resizing...`);
         needsResize = true;
-        resizeReason = `dimensions (${width}x${height}) exceed ${maxDimension}px`;
       }
       
-      // Check if file size exceeds maxSize
+      // Check file size
       if (imageBuffer.length > maxSizeBytes) {
+        console.log(`Image exceeds ${maxSize}MB, compressing...`);
         needsResize = true;
-        resizeReason = resizeReason 
-          ? `${resizeReason} AND file size (${(imageBuffer.length / 1024 / 1024).toFixed(2)}MB) exceeds ${maxSize}MB`
-          : `file size (${(imageBuffer.length / 1024 / 1024).toFixed(2)}MB) exceeds ${maxSize}MB`;
       }
       
       if (needsResize) {
-        console.log(`Resizing ${file}: ${resizeReason}`);
-        
-        const resizedPath = filePath.replace('.png', '_resized.png');
-        
-        // Calculate new dimensions maintaining aspect ratio
+        // Calculate new dimensions
         let newWidth = width;
         let newHeight = height;
         
-        // First, ensure dimensions are under maxDimension
         if (width > maxDimension || height > maxDimension) {
           if (width > height) {
             newWidth = maxDimension;
@@ -185,51 +199,29 @@ app.post('/api/convert-to-images', async (req, res) => {
             newHeight = maxDimension;
             newWidth = Math.floor(width * (maxDimension / height));
           }
-          
-          console.log(`  → Dimension resize: ${width}x${height} → ${newWidth}x${newHeight}`);
         }
         
-        // Resize using ImageMagick with dimension constraints
-        await execAsync(`convert "${filePath}" -resize ${newWidth}x${newHeight} "${resizedPath}"`);
+        // Convert to JPEG for better compression and less memory usage
+        const jpegPath = filePath.replace('.png', '.jpg');
         
-        imageBuffer = await fs.readFile(resizedPath);
+        // Use progressive resizing for memory efficiency
+        await execAsync(`convert "${filePath}" -limit memory 256MB -limit map 512MB -resize ${newWidth}x${newHeight} -quality 85 -strip "${jpegPath}"`);
         
-        // If still too large by file size, reduce quality
-        if (imageBuffer.length > maxSizeBytes) {
-          console.log(`  → Still ${(imageBuffer.length / 1024 / 1024).toFixed(2)}MB, reducing quality...`);
-          
-          // Calculate quality reduction needed
-          const qualityFactor = Math.sqrt(maxSizeBytes / imageBuffer.length) * 0.9; // 0.9 for safety
-          const quality = Math.max(60, Math.floor(qualityFactor * 100)); // Min 60% quality
-          
-          const qualityPath = filePath.replace('.png', '_quality.png');
-          await execAsync(`convert "${resizedPath}" -quality ${quality} "${qualityPath}"`);
-          
-          await fs.unlink(resizedPath);
-          imageBuffer = await fs.readFile(qualityPath);
-          await fs.unlink(qualityPath);
-        } else {
-          await fs.unlink(resizedPath);
-        }
+        imageBuffer = await fs.readFile(jpegPath);
+        await fs.unlink(jpegPath);
         
-        console.log(`  ✓ Final: ${(imageBuffer.length / 1024 / 1024).toFixed(2)}MB`);
+        console.log(`  → Resized to ${newWidth}x${newHeight}, ${(imageBuffer.length / 1024 / 1024).toFixed(2)}MB`);
       }
       
       const base64Image = imageBuffer.toString('base64');
       const match = file.match(/-(\d+)\.png$/);
       const pageNum = match ? parseInt(match[1]) : responseImages.length + 1;
       
-      // Get final dimensions
-      const finalDimensions = needsResize ? 
-        await execAsync(`identify -format "%w %h" "${filePath}"`).then(r => r.stdout.trim()) :
-        `${width} ${height}`;
-      const [finalWidth, finalHeight] = finalDimensions.split(' ').map(Number);
-      
       responseImages.push({ 
         page: pageNum, 
         base64: base64Image,
         size_mb: (imageBuffer.length / 1024 / 1024).toFixed(2),
-        dimensions: `${finalWidth}x${finalHeight}`,
+        dimensions: `${width}x${height}`,
         resized: needsResize
       });
       
@@ -243,6 +235,7 @@ app.post('/api/convert-to-images', async (req, res) => {
     return res.status(200).json({ 
       count: responseImages.length, 
       images: responseImages,
+      dpi: dpi,
       maxDimension: maxDimension,
       maxSize: maxSize
     });
